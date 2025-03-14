@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app  
+  namespace: default  
+  labels:
+    app: web-app 
+spec:
+  replicas: 2  # Минимальное количество подов. Ночью нагрузка низкая, но не менее 2 подов для отказоустойчивости
+  selector:
+    matchLabels:
+      app: web-app 
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      topologySpreadConstraints:  # Гарантируем равномерное распределение подов по зонам
+        - maxSkew: 1  # Не допускаем сильного дисбаланса между зонами (максимальная разница подов между зонами = 1)
+          topologyKey: topology.kubernetes.io/zone  # Определяем зоны, по которым будут распределяться поды
+          whenUnsatisfiable: DoNotSchedule  # Если невозможно равномерно распределить, K8s НЕ будет запускать под
+          labelSelector:
+            matchLabels:
+              app: web-app
+      containers:
+        - name: web-app  
+          image: my-web-app:latest  
+          resources:
+            requests:
+              cpu: "1000m"  # Запрашиваем 1 CPU на старте для быстрого прогрева, это важно, так как первые запросы требуют больше CPU
+              memory: "128Mi"  # Минимальный запрос памяти, потребление памяти не скачет, так что этого достаточно должно быть
+            limits:
+              cpu: "1"  # Ограничиваем CPU до 1, чтобы не перегружать ноду и исключить чрезмерное потребление
+              memory: "256Mi"  # Максимальное потребление памяти 256Mi, сделаем небольшой запас на случай кратковременных пиков
+          readinessProbe:  # Проверка готовности пода к обработке трафика, важно, чтобы трафик не поступал до полной инициализации
+            httpGet:
+              path: /healthz  # URL, который проверяет, готово ли приложение принимать запросы
+              port: 80
+            initialDelaySeconds: 5  # Подождать 5 сек перед первой проверкой, чтобы дать контейнеру шанс запуститься
+            periodSeconds: 10  # Проверять готовность каждые 10 сек
+          livenessProbe:  # Проверка, жив ли контейнер, если перестанет отвечать, K8s его перезапустит
+            httpGet:
+              path: /healthz  # URL для проверки жизнеспособности
+              port: 80
+            initialDelaySeconds: 10  # Подождать 10 сек перед первой проверкой (нужно больше времени на запуск)
+            periodSeconds: 20  # Проверять живучесть каждые 20 сек
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa  # Авто-масштабирование подов
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2  # Минимум 2 пода ночью, соблюдаем баланс между отказоустойчивостью и экономией ресурсов
+  maxReplicas: 4  # Максимум 4 пода днём, исходя из результатов нагрузочного тестирования делаем вывод, что этого хватает
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50  # Если загрузка CPU > 50%, создаётся новый под, чтобы справиться с нагрузкой
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-service  # Имя сервиса
+  namespace: default  # Используем пространство имен по умолчанию
+spec:
+  selector:
+    app: web-app  # Сервис будет направлять трафик только на поды с этой меткой
+  ports:
+    - protocol: TCP  # Используем протокол TCP, так как приложение работает по HTTP/HTTPS
+      port: 80  # Входной порт сервиса, клиенты обращаются к сервису на этот порт
+      targetPort: 80  # Порт контейнера, куда будет перенаправляться трафик внутри пода, приложение слушает 80-й порт
+  type: ClusterIP  # Доступ только внутри кластера, внешний доступ невозможен без Ingress или LoadBalancer
